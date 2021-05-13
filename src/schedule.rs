@@ -1,6 +1,6 @@
 
-use chrono::offset::TimeZone;
-use chrono::{DateTime, Datelike, Timelike, Utc};
+use chrono::offset::{LocalResult, TimeZone};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, NaiveDateTime, Timelike, Utc};
 use std::ops::Bound::{Included, Unbounded};
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
@@ -31,7 +31,7 @@ impl Schedule {
         }
     }
 
-    fn next_after<Z>(&self, after: &DateTime<Z>) -> Option<DateTime<Z>>
+    fn next_after<Z>(&self, after: &DateTime<Z>) -> LocalResult<DateTime<Z>>
     where
         Z: TimeZone,
     {
@@ -87,23 +87,41 @@ impl Schedule {
 
                             for second in self.fields.seconds.ordinals().range(second_range).cloned() {
                                 let timezone = after.timezone();
-                                let candidate = if let Some(candidate) = timezone
-                                    .ymd(year as i32, month, day_of_month)
-                                    .and_hms_opt(hour, minute, second)
-                                {
-                                    candidate
-                                } else {
-                                    continue;
+                                match timezone.from_local_datetime(&NaiveDateTime::new(
+                                    NaiveDate::from_ymd(year as i32, month, day_of_month),
+                                    NaiveTime::from_hms(hour, minute, second)
+                                )) {
+                                    LocalResult::None => continue,
+                                    LocalResult::Single(single) => {
+                                        if self
+                                            .fields
+                                            .days_of_week
+                                            .ordinals()
+                                            .contains(&single.weekday().number_from_sunday())
+                                        {
+                                            return LocalResult::Single(single);
+                                        }
+                                        continue 'day_loop;
+                                    }
+                                    LocalResult::Ambiguous(earlier, later) => {
+                                        let earlier_matches = self
+                                            .fields
+                                            .days_of_week
+                                            .ordinals()
+                                            .contains(&earlier.weekday().number_from_sunday());
+                                        let later_matches = self
+                                            .fields
+                                            .days_of_week
+                                            .ordinals()
+                                            .contains(&later.weekday().number_from_sunday());
+                                        match (earlier_matches, later_matches) {
+                                            (false, false) => continue 'day_loop,
+                                            (true, false) => return LocalResult::Single(earlier),
+                                            (false, true) => return LocalResult::Single(later),
+                                            (true, true) => return LocalResult::Ambiguous(earlier, later),
+                                        };
+                                    }
                                 };
-                                if !self
-                                    .fields
-                                    .days_of_week
-                                    .ordinals()
-                                    .contains(&candidate.weekday().number_from_sunday())
-                                {
-                                    continue 'day_loop;
-                                }
-                                return Some(candidate);
                             }
                             query.reset_minute();
                         } // End of minutes range
@@ -116,10 +134,10 @@ impl Schedule {
         }
 
         // We ran out of dates to try.
-        None
+        LocalResult::None
     }
 
-    fn prev_from<Z>(&self, before: &DateTime<Z>) -> Option<DateTime<Z>>
+    fn prev_from<Z>(&self, before: &DateTime<Z>) -> LocalResult<DateTime<Z>>
     where
         Z: TimeZone,
     {
@@ -185,23 +203,41 @@ impl Schedule {
                             for second in self.fields.seconds.ordinals().range(second_range).rev().cloned()
                             {
                                 let timezone = before.timezone();
-                                let candidate = if let Some(candidate) = timezone
-                                    .ymd(year as i32, month, day_of_month)
-                                    .and_hms_opt(hour, minute, second)
-                                {
-                                    candidate
-                                } else {
-                                    continue;
+                                match timezone.from_local_datetime(&NaiveDateTime::new(
+                                    NaiveDate::from_ymd(year as i32, month, day_of_month),
+                                    NaiveTime::from_hms(hour, minute, second)
+                                )) {
+                                    LocalResult::None => continue,
+                                    LocalResult::Single(single) => {
+                                        if self
+                                            .fields
+                                            .days_of_week
+                                            .ordinals()
+                                            .contains(&single.weekday().number_from_sunday())
+                                        {
+                                            return LocalResult::Single(single);
+                                        }
+                                        continue 'day_loop;
+                                    }
+                                    LocalResult::Ambiguous(earlier, later) => {
+                                        let earlier_matches = self
+                                            .fields
+                                            .days_of_week
+                                            .ordinals()
+                                            .contains(&earlier.weekday().number_from_sunday());
+                                        let later_matches = self
+                                            .fields
+                                            .days_of_week
+                                            .ordinals()
+                                            .contains(&later.weekday().number_from_sunday());
+                                        match (earlier_matches, later_matches) {
+                                            (false, false) => continue 'day_loop,
+                                            (true, false) => return LocalResult::Single(earlier),
+                                            (false, true) => return LocalResult::Single(later),
+                                            (true, true) => return LocalResult::Ambiguous(earlier, later),
+                                        };
+                                    }
                                 };
-                                if !self
-                                    .fields
-                                    .days_of_week
-                                    .ordinals()
-                                    .contains(&candidate.weekday().number_from_sunday())
-                                {
-                                    continue 'day_loop;
-                                }
-                                return Some(candidate);
                             }
                             query.reset_minute();
                         } // End of minutes range
@@ -214,7 +250,7 @@ impl Schedule {
         }
 
         // We ran out of dates to try.
-        None
+        LocalResult::None
     }
 
     /// Provides an iterator which will return each DateTime that matches the schedule starting with
@@ -346,6 +382,7 @@ where
     is_done: bool,
     schedule: &'a Schedule,
     previous_datetime: DateTime<Z>,
+    next_ambiguous: Option<DateTime<Z>>,
 }
 //TODO: Cutoff datetime?
 
@@ -358,6 +395,7 @@ where
             is_done: false,
             schedule,
             previous_datetime: starting_datetime.clone(),
+            next_ambiguous: None,
         }
     }
 }
@@ -372,12 +410,24 @@ where
         if self.is_done {
             return None;
         }
-        if let Some(next_datetime) = self.schedule.next_after(&self.previous_datetime) {
-            self.previous_datetime = next_datetime.clone();
-            Some(next_datetime)
-        } else {
-            self.is_done = true;
-            None
+        if let Some(next) = self.next_ambiguous.take() {
+            self.previous_datetime = next.clone();
+            return Some(next);
+        }
+        match self.schedule.next_after(&self.previous_datetime) {
+            LocalResult::None => {
+                self.is_done = true;
+                None
+            }
+            LocalResult::Single(single) => {
+                self.previous_datetime = single.clone();
+                Some(single)
+            }
+            LocalResult::Ambiguous(earlier, later) => {
+                self.previous_datetime = earlier.clone();
+                self.next_ambiguous = Some(later);
+                Some(earlier)
+            }
         }
     }
 }
@@ -390,13 +440,24 @@ where
         if self.is_done {
             return None;
         }
-
-        if let Some(prev_datetime) = self.schedule.prev_from(&self.previous_datetime) {
-            self.previous_datetime = prev_datetime.clone();
-            Some(prev_datetime)
-        } else {
-            self.is_done = true;
-            None
+        if let Some(next) = self.next_ambiguous.take() {
+            self.previous_datetime = next.clone();
+            return Some(next);
+        }
+        match self.schedule.prev_from(&self.previous_datetime) {
+            LocalResult::None => {
+                self.is_done = true;
+                None
+            }
+            LocalResult::Single(single) => {
+                self.previous_datetime = single.clone();
+                Some(single)
+            }
+            LocalResult::Ambiguous(earlier, later) => {
+                self.previous_datetime = later.clone();
+                self.next_ambiguous = Some(earlier);
+                Some(later)
+            }
         }
     }
 }
@@ -430,15 +491,15 @@ mod test {
 
         let next = schedule.next_after(&Utc::now());
         println!("NEXT AFTER for {} {:?}", expression, next);
-        assert!(next.is_some());
+        assert!(next.single().is_some());
 
         let next2 = schedule.next_after(&next.unwrap());
         println!("NEXT2 AFTER for {} {:?}", expression, next2);
-        assert!(next2.is_some());
+        assert!(next2.single().is_some());
 
         let prev = schedule.prev_from(&next2.unwrap());
         println!("PREV FROM for {} {:?}", expression, prev);
-        assert!(prev.is_some());
+        assert!(prev.single().is_some());
         assert_eq!(prev, next);
     }
 
@@ -448,7 +509,7 @@ mod test {
         let schedule = Schedule::from_str(expression).unwrap();
         let prev = schedule.prev_from(&Utc::now());
         println!("PREV FROM for {} {:?}", expression, prev);
-        assert!(prev.is_some());
+        assert!(prev.single().is_some());
     }
 
     #[test]
@@ -457,7 +518,7 @@ mod test {
         let schedule = Schedule::from_str(expression).unwrap();
         let next = schedule.next_after(&Utc::now());
         println!("NEXT AFTER for {} {:?}", expression, next);
-        assert!(next.is_some());
+        assert!(next.single().is_some());
     }
 
     #[test]
@@ -567,8 +628,10 @@ mod test {
             .checked_add_signed(chrono::Duration::hours(1)) // puts it in the middle of the DST transition
             .unwrap();
         let schedule = Schedule::from_str("* * * * * Sat,Sun *").unwrap();
-        let prev = schedule.after(&dt).rev().next().unwrap();
-        assert!(prev < dt); // test is ensuring line above does not panic
+        let mut iter = schedule.after(&dt).rev();
+        let prev1 = iter.next().unwrap();
+        let prev2 = iter.next().unwrap();
+        assert!(prev2 < prev1);
     }
     
     #[test]
